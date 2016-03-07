@@ -52,14 +52,19 @@
 #include "sonar.h"
 #include "sonar_mode_filter.h"
 
+
+/* This file is for lidar-lite v1 distance sensor via PWM.
+ * Sonar data is replaced by lidar data.
+ * by ma hc, mhc@thu.news
+ */
+
+
 #define SONAR_SCALE	1000.0f
-#define SONAR_MIN	0.12f		/** 0.12m sonar minimum distance */
-#define SONAR_MAX	3.5f		/** 3.50m sonar maximum distance */
+#define SONAR_MIN	0.05f		/** 0.12m sonar minimum distance */
+#define SONAR_MAX	30.0f		/** 3.50m sonar maximum distance */
 
-#define atoi(nptr)  strtol((nptr), NULL, 10)
+
 extern uint32_t get_boot_time_us(void);
-
-static char data_buffer[5]; // array for collecting decoded data
 
 static volatile uint32_t last_measure_time = 0;
 static volatile uint32_t measure_time = 0;
@@ -83,77 +88,41 @@ float sonar_raw = 0.0f;  // m
 float sonar_mode = 0.0f;
 bool sonar_valid = false;				/**< the mode of all sonar measurements */
 
-/**
-  * @brief  Triggers the sonar to measure the next value
-  *
-  * see datasheet for more info
-  */
-void sonar_trigger(){
-	GPIO_SetBits(GPIOE, GPIO_Pin_8);
-}
 
-/**
-  * @brief  Sonar interrupt handler
-  */
-void UART4_IRQHandler(void)
+
+void TIM4_IRQHandler(void)
 {
-	if (USART_GetITStatus(UART4, USART_IT_RXNE) != RESET)
+	RCC_ClocksTypeDef RCC_Clocks;
+	RCC_GetClocksFreq(&RCC_Clocks);
+
+	/* Clear TIM4 Capture compare interrupt pending bit */
+	TIM_ClearITPendingBit(TIM4, TIM_IT_CC2);
+
+	/* Get the Input Capture value */
+	uint32_t IC1Value = TIM_GetCapture1(TIM4);
+
+	//TODO The lidar-lite Module I'm using has an offset around 20cm.I don't know if it's a feature of lidar-lite.
+	uint32_t temp = IC1Value * 128000000.0f / RCC_Clocks.HCLK_Frequency - 200;
+
+	/* use real-world maximum ranges to cut off pure noise */
+	if ((temp > SONAR_MIN) && (temp < SONAR_MAX))
 	{
-		/* Read one byte from the receive data register */
-		uint8_t data = (USART_ReceiveData(UART4));
-
-		if (data == 'R')
-		{
-			/* this is the first char (start of transmission) */
-			data_counter = 0;
-			data_valid = 1;
-
-			/* set sonar pin 4 to low -> we want triggered mode */
-			GPIO_ResetBits(GPIOE, GPIO_Pin_8);
-		}
-		else if (0x30 <= data && data <= 0x39)
-		{
-			if (data_valid)
-			{
-				data_buffer[data_counter] = data;
-				data_counter++;
-			}
-		}
-		else if (data == 0x0D)
-		{
-			if (data_valid && data_counter == 4)
-			{
-				data_buffer[4] = 0;
-				int temp = atoi(data_buffer);
-
-				/* use real-world maximum ranges to cut off pure noise */
-				if ((temp > SONAR_MIN*SONAR_SCALE) && (temp < SONAR_MAX*SONAR_SCALE))
-				{
-					/* it is in normal sensor range, take it */
-					last_measure_time = measure_time;
-					measure_time = get_boot_time_us();
-					sonar_measure_time_interrupt = measure_time;
-					dt = ((float)(measure_time - last_measure_time)) / 1000000.0f;
-
-					valid_data = temp;
-					// the mode filter turned out to be more problematic
-					// than using the raw value of the sonar
-					//insert_sonar_value_and_get_mode_value(valid_data / SONAR_SCALE);
-					sonar_mode = valid_data / SONAR_SCALE;
-					new_value = 1;
-					sonar_valid = true;
-				} else {
-					sonar_valid = false;
-				}
-			}
-
-			data_valid = 0;
-		}
-		else
-		{
-			data_valid = 0;
-		}
+		/* it is in normal sensor range, take it */
+		last_measure_time = measure_time;
+		measure_time = get_boot_time_us();
+		sonar_measure_time_interrupt = measure_time;
+		dt = ((float)(measure_time - last_measure_time)) / 1000000.0f;
+		valid_data = temp;
+		// the mode filter turned out to be more problematic
+		// than using the raw value of the sonar
+		//insert_sonar_value_and_get_mode_value(valid_data / SONAR_SCALE);
+		sonar_mode = valid_data / SONAR_SCALE;
+		new_value = 1;
+		sonar_valid = true;
+	} else {
+		sonar_valid = false;
 	}
+
 }
 
 /**
@@ -212,62 +181,59 @@ void sonar_config(void)
 	valid_data = 0;
 
 	GPIO_InitTypeDef GPIO_InitStructure;
-
-	/* Enable GPIO clocks */
-	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE);
-
-	/* Configure l3gd20 CS pin in output pushpull mode */
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8;
-	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_OUT;
-	GPIO_InitStructure.GPIO_OType = GPIO_OType_OD;
-	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-	GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
-	GPIO_Init(GPIOE, &GPIO_InitStructure);
-
-	/* Configures the nested vectored interrupt controller. */
 	NVIC_InitTypeDef NVIC_InitStructure;
+	TIM_ICInitTypeDef  TIM_ICInitStructure;
 
-	/* Enable the USARTx Interrupt */
-	NVIC_InitStructure.NVIC_IRQChannel = UART4_IRQn;
+	/* TIM4 clock enable */
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+
+	/* GPIOD clock enable */
+	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOD, ENABLE);
+
+	/* TIM4 chennel2 configuration : PD.13 */
+	GPIO_InitStructure.GPIO_Pin   = GPIO_Pin_13;
+	GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_AF;
+	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_100MHz;
+	GPIO_InitStructure.GPIO_OType = GPIO_OType_PP;
+	GPIO_InitStructure.GPIO_PuPd  = GPIO_PuPd_NOPULL;
+	GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+	/* Connect TIM pin to AF2 */
+	GPIO_PinAFConfig(GPIOD, GPIO_PinSource13, GPIO_AF_TIM4);
+
+	/* Enable the TIM4 global Interrupt */
+	NVIC_InitStructure.NVIC_IRQChannel = TIM4_IRQn;
 	NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 0;
 	NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
 	NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
 	NVIC_Init(&NVIC_InitStructure);
 
-	/* Enable the USART clock */
-	RCC_APB1PeriphClockCmd(RCC_APB1Periph_UART4, ENABLE);
-	/* Enable GPIO clocks */
-	RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE);
+	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	TIM_TimeBaseStructure.TIM_Period = 0xFFFF;
+	TIM_TimeBaseStructure.TIM_Prescaler = 63;      //时钟64分频
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+	TIM_TimeBaseInit(TIM4, &TIM_TimeBaseStructure);//时基初始化
 
-	/* Connect UART pins to AF7 */
-	GPIO_PinAFConfig(GPIOC, GPIO_PinSource11, GPIO_AF_UART4);
+	TIM_ICInitStructure.TIM_Channel = TIM_Channel_2;
+	TIM_ICInitStructure.TIM_ICPolarity = TIM_ICPolarity_Rising;
+	TIM_ICInitStructure.TIM_ICSelection = TIM_ICSelection_DirectTI;
+	TIM_ICInitStructure.TIM_ICPrescaler = TIM_ICPSC_DIV1;
+	TIM_ICInitStructure.TIM_ICFilter = 0x0;
 
-	GPIO_InitTypeDef GPIO_InitStructure_Serial2;
-	GPIO_InitStructure_Serial2.GPIO_Mode = GPIO_Mode_AF;
-	GPIO_InitStructure_Serial2.GPIO_Speed = GPIO_Speed_100MHz;
-	GPIO_InitStructure_Serial2.GPIO_OType = GPIO_OType_PP;
-	GPIO_InitStructure_Serial2.GPIO_PuPd = GPIO_PuPd_UP;
+	TIM_PWMIConfig(TIM4, &TIM_ICInitStructure);
 
-	/* USART RX pin configuration */
-	GPIO_InitStructure_Serial2.GPIO_Pin = GPIO_Pin_11;
-	GPIO_Init(GPIOC, &GPIO_InitStructure_Serial2);
+	/* Select the TIM4 Input Trigger: TI2FP2 */
+	TIM_SelectInputTrigger(TIM4, TIM_TS_TI2FP2);
 
-	USART_InitTypeDef USART_InitStructure;
+	/* Select the slave Mode: Reset Mode */
+	TIM_SelectSlaveMode(TIM4, TIM_SlaveMode_Reset);
+	TIM_SelectMasterSlaveMode(TIM4,TIM_MasterSlaveMode_Enable);
 
-	USART_InitStructure.USART_BaudRate = 9600;
-	USART_InitStructure.USART_WordLength = USART_WordLength_8b;
-	USART_InitStructure.USART_StopBits = USART_StopBits_1;
-	USART_InitStructure.USART_Parity = USART_Parity_No;
-	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
-	USART_InitStructure.USART_Mode = USART_Mode_Rx;
+	/* TIM enable counter */
+	TIM_Cmd(TIM4, ENABLE);
 
-	/* Configure the UART4 */
-	USART_Init(UART4, &USART_InitStructure);
-
-	/* Enable UART4 interrupt */
-	USART_ITConfig(UART4, USART_IT_RXNE, ENABLE);
-
-	USART_Cmd(UART4, ENABLE);
+	/* Enable the CC2 Interrupt Request */
+	TIM_ITConfig(TIM4, TIM_IT_CC2, ENABLE);
 
 }
 

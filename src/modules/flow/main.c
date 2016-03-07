@@ -157,7 +157,8 @@ void timer_update_ms(void)
 
 	if (timer[TIMER_SONAR] == 0)
 	{
-		sonar_trigger();
+		//TODO : check what happens to timer[TIMER_SONAR]
+//		sonar_trigger();
 		timer[TIMER_SONAR] = SONAR_TIMER_COUNT;
 	}
 
